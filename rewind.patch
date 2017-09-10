@@ -1,0 +1,507 @@
+ src/emu/inpttype.h          |   7 +-
+ src/emu/ioport.h            |   1 +
+ src/emu/save.cpp            | 295 +++++++++++++++++++++++++++++++++++++++++---
+ src/emu/save.h              |  43 ++++++-
+ src/frontend/mame/ui/ui.cpp |   7 ++
+ 5 files changed, 328 insertions(+), 25 deletions(-)
+
+diff --git a/src/emu/inpttype.h b/src/emu/inpttype.h
+index 7169c6f..182407f 100644
+--- a/src/emu/inpttype.h
++++ b/src/emu/inpttype.h
+@@ -820,11 +820,12 @@ inline void construct_core_types_keypad(simple_list<input_type_entry> &typelist)
+ 
+ inline void construct_core_types_UI(simple_list<input_type_entry> &typelist)
+ {
+-	INPUT_PORT_DIGITAL_TYPE( 0, UI,      UI_ON_SCREEN_DISPLAY,"On Screen Display",      input_seq(KEYCODE_TILDE) )
+-	INPUT_PORT_DIGITAL_TYPE( 0, UI,      UI_DEBUG_BREAK,      "Break in Debugger",      input_seq(KEYCODE_TILDE) )
++	INPUT_PORT_DIGITAL_TYPE( 0, UI,      UI_ON_SCREEN_DISPLAY,"On Screen Display",      input_seq(KEYCODE_TILDE, input_seq::not_code, KEYCODE_LSHIFT) )
++	INPUT_PORT_DIGITAL_TYPE( 0, UI,      UI_DEBUG_BREAK,      "Break in Debugger",      input_seq(KEYCODE_TILDE, input_seq::not_code, KEYCODE_LSHIFT) )
+ 	INPUT_PORT_DIGITAL_TYPE( 0, UI,      UI_CONFIGURE,        "Config Menu",            input_seq(KEYCODE_TAB) )
+ 	INPUT_PORT_DIGITAL_TYPE( 0, UI,      UI_PAUSE,            "Pause",                  input_seq(KEYCODE_P, input_seq::not_code, KEYCODE_LSHIFT, input_seq::not_code, KEYCODE_RSHIFT) )
+-	INPUT_PORT_DIGITAL_TYPE( 0, UI,      UI_PAUSE_SINGLE,     "Pause - Single Step",    input_seq(KEYCODE_P, KEYCODE_LSHIFT, input_seq::or_code, KEYCODE_P, KEYCODE_RSHIFT) )
++	INPUT_PORT_DIGITAL_TYPE( 0, UI,      UI_PAUSE_SINGLE,     "Pause - Single Step",    input_seq(KEYCODE_P, KEYCODE_LSHIFT) )
++	INPUT_PORT_DIGITAL_TYPE( 0, UI,      UI_REWIND_SINGLE,    "Rewind - Single Step",   input_seq(KEYCODE_TILDE, KEYCODE_LSHIFT, input_seq::or_code, KEYCODE_TILDE, KEYCODE_RSHIFT) )
+ 	INPUT_PORT_DIGITAL_TYPE( 0, UI,      UI_RESET_MACHINE,    "Reset Machine",          input_seq(KEYCODE_F3, KEYCODE_LSHIFT) )
+ 	INPUT_PORT_DIGITAL_TYPE( 0, UI,      UI_SOFT_RESET,       "Soft Reset",             input_seq(KEYCODE_F3, input_seq::not_code, KEYCODE_LSHIFT) )
+ 	INPUT_PORT_DIGITAL_TYPE( 0, UI,      UI_SHOW_GFX,         "Show Gfx",               input_seq(KEYCODE_F4) )
+diff --git a/src/emu/ioport.h b/src/emu/ioport.h
+index 7b434c5..6a72bdd 100644
+--- a/src/emu/ioport.h
++++ b/src/emu/ioport.h
+@@ -322,6 +322,7 @@ enum ioport_type
+ 		IPT_UI_DEBUG_BREAK,
+ 		IPT_UI_PAUSE,
+ 		IPT_UI_PAUSE_SINGLE,
++		IPT_UI_REWIND_SINGLE,
+ 		IPT_UI_RESET_MACHINE,
+ 		IPT_UI_SOFT_RESET,
+ 		IPT_UI_SHOW_GFX,
+diff --git a/src/emu/save.cpp b/src/emu/save.cpp
+index c85f0d1..a4d69d8 100644
+--- a/src/emu/save.cpp
++++ b/src/emu/save.cpp
+@@ -60,10 +60,11 @@ enum
+ //-------------------------------------------------
+ 
+ save_manager::save_manager(running_machine &machine)
+-	: m_machine(machine),
+-		m_reg_allowed(true),
+-		m_illegal_regs(0)
++	: m_machine(machine)
++	, m_reg_allowed(true)
++	, m_illegal_regs(0)
+ {
++	m_rewind = std::make_unique<rewinder>(*this);
+ }
+ 
+ 
+@@ -169,8 +170,8 @@ void save_manager::save_memory(device_t *device, const char *module, const char
+ 		totalname = string_format("%s/%X/%s", module, index, name);
+ 
+ 	// look for duplicates and an entry to insert in front of
+-	std::vector<std::unique_ptr<state_entry>>::iterator  insert_after = m_entry_list.begin();
+-	for (auto it = m_entry_list.begin(); it!= m_entry_list.end(); ++it)
++	std::vector<std::unique_ptr<state_entry>>::iterator insert_after = m_entry_list.begin();
++	for (auto it = m_entry_list.begin(); it != m_entry_list.end(); ++it)
+ 	{
+ 		// stop when we find an entry whose name is after ours
+ 		if (it->get()->m_name.compare(totalname)>0)
+@@ -183,7 +184,7 @@ void save_manager::save_memory(device_t *device, const char *module, const char
+ 	}
+ 
+ 	// insert us into the list
+-	m_entry_list.insert(insert_after,std::make_unique<state_entry>(val, totalname.c_str(), device, module, tag ? tag : "", index, valsize, valcount));
++	m_entry_list.insert(insert_after, std::make_unique<state_entry>(val, totalname.c_str(), device, module, tag ? tag : "", index, valsize, valcount));
+ }
+ 
+ 
+@@ -213,18 +214,19 @@ save_error save_manager::check_file(running_machine &machine, emu_file &file, co
+ 	return validate_header(header, gamename, sig, errormsg, "");
+ }
+ 
++
+ //-------------------------------------------------
+ //  dispatch_postload - invoke all registered
+ //  postload callbacks for updates
+ //-------------------------------------------------
+ 
+-
+ void save_manager::dispatch_postload()
+ {
+ 	for (auto &func : m_postload_list)
+ 		func->m_func();
+ }
+ 
++
+ //-------------------------------------------------
+ //  read_file - read the data from a file
+ //-------------------------------------------------
+@@ -269,18 +271,19 @@ save_error save_manager::read_file(emu_file &file)
+ 	return STATERR_NONE;
+ }
+ 
++
+ //-------------------------------------------------
+ //  dispatch_presave - invoke all registered
+ //  presave callbacks for updates
+ //-------------------------------------------------
+ 
+-
+ void save_manager::dispatch_presave()
+ {
+ 	for (auto &func : m_presave_list)
+ 		func->m_func();
+ }
+ 
++
+ //-------------------------------------------------
+ //  write_file - writes the data to a file
+ //-------------------------------------------------
+@@ -415,26 +418,282 @@ save_manager::state_callback::state_callback(save_prepost_delegate callback)
+ 
+ 
+ //-------------------------------------------------
++//  ram_state - constructor
++//-------------------------------------------------
++
++ram_state::ram_state(save_manager &save)
++	: m_save(save)
++	, m_data()
++	, m_valid(false)
++	, m_time(m_save.machine().time())
++{
++	m_data.reserve(get_size(save));
++	m_data.clear();
++	m_data.rdbuf()->clear();
++}
++
++
++//-------------------------------------------------
++//  get_size - utility function to get the
++//  uncompressed size of a state
++//-------------------------------------------------
++
++size_t ram_state::get_size(save_manager &save)
++{
++	size_t totalsize = 0;
++
++	for (auto &entry : save.m_entry_list)
++	{
++		totalsize += entry->m_typesize * entry->m_typecount;
++	}
++
++	return totalsize + HEADER_SIZE;
++}
++
++
++//-------------------------------------------------
++//  save - write the current machine state to the
++//  allocated stream
++//-------------------------------------------------
++
++save_error ram_state::save()
++{
++	// if we have illegal registrations, return an error
++	if (m_save.m_illegal_regs > 0)
++		return STATERR_ILLEGAL_REGISTRATIONS;
++
++	// generate the header
++	u8 header[HEADER_SIZE];
++	memcpy(&header[0], STATE_MAGIC_NUM, 8);
++	header[8] = SAVE_VERSION;
++	header[9] = NATIVE_ENDIAN_VALUE_LE_BE(0, SS_MSB_FIRST);
++	strncpy((char *)&header[0x0a], m_save.machine().system().name, 0x1c - 0x0a);
++	u32 sig = m_save.signature();
++	*(u32 *)&header[0x1c] = little_endianize_int32(sig);
++
++	// write the header
++	m_data.write((char *)header, sizeof(header));
++
++	// call the pre-save functions
++	m_save.dispatch_presave();
++
++	// write all the data
++	for (auto &entry : m_save.m_entry_list)
++	{
++		u32 totalsize = entry->m_typesize * entry->m_typecount;
++		m_data.write((char *)entry->m_data, totalsize);
++
++		// check for any errors
++		if (!m_data)
++			return STATERR_WRITE_ERROR;
++	}
++
++	m_valid = true;
++	m_time = m_save.machine().time();
++
++	return STATERR_NONE;
++}
++
++
++//-------------------------------------------------
++//  load - restore the machine state from the
++//  stream
++//-------------------------------------------------
++
++save_error ram_state::load()
++{
++	// if we have illegal registrations, return an error
++	if (m_save.m_illegal_regs > 0)
++		return STATERR_ILLEGAL_REGISTRATIONS;
++
++	// read the header
++	u8 header[HEADER_SIZE];
++	m_data.read((char *)header, sizeof(header));
++
++	// verify the header and report an error if it doesn't match
++	u32 sig = m_save.signature();
++	if (m_save.validate_header(header, m_save.machine().system().name, sig, nullptr, "Error: ") != STATERR_NONE)
++		return STATERR_INVALID_HEADER;
++
++	// determine whether or not to flip the data when done
++	bool flip = NATIVE_ENDIAN_VALUE_LE_BE((header[9] & SS_MSB_FIRST) != 0, (header[9] & SS_MSB_FIRST) == 0);
++
++	// read all the data, flipping if necessary
++	for (auto &entry : m_save.m_entry_list)
++	{
++		u32 totalsize = entry->m_typesize * entry->m_typecount;
++		m_data.read((char *)entry->m_data, totalsize);
++
++		// check for any errors
++		if (!m_data)
++			return STATERR_READ_ERROR;
++
++		// handle flipping
++		if (flip)
++			entry->flip_data();
++	}
++
++	// call the post-load functions
++	m_save.dispatch_postload();
++
++	return STATERR_NONE;
++}
++
++
++//-------------------------------------------------
++//  rewinder - constuctor
++//-------------------------------------------------
++
++rewinder::rewinder(save_manager &save)
++	: m_save(save)
++	, m_capacity(100)
++{
++}
++
++
++//-------------------------------------------------
++//  get_current_index - get the index of the
++//  state to assume as current
++//-------------------------------------------------
++
++int rewinder::get_current_index()
++{
++	if (state_list().empty())
++		return -1;
++
++	// fetch the current machine time
++	attotime curtime = m_save.machine().time();
++
++	// find the state at the current time, or at least the first one after
++	for (auto it = state_list().begin(); it < state_list().end(); ++it)
++		if (it->get()->m_time >= curtime)
++			return it - state_list().begin();
++
++	// no state matches the criterion
++	return -1;
++}
++
++
++//-------------------------------------------------
++//  check_size - shrink the state list if it is
++//  about to hit the capacity
++//-------------------------------------------------
++
++void rewinder::check_size()
++{
++	// continuously drop states while we are beyond capacity
++	while (state_list().size() + 1 > m_capacity)
++	{
++		// default to the last invalid state
++		auto it = state_list().end();
++
++		// if the last state is valid, drop the oldest one instead
++		if (it->get()->m_valid)
++			it = state_list().begin();
++
++		state_list().erase(it);
++	}
++}
++
++
++//-------------------------------------------------
++//  capture - record a single state
++//-------------------------------------------------
++
++save_error rewinder::capture()
++{
++	// fetch the current machine time
++	attotime curtime = m_save.machine().time();
++
++	// fetch the current state index
++	int index = get_current_index();
++
++	if (index == -1)
++	{
++		// no current state, create one
++		std::unique_ptr<ram_state> state = std::make_unique<ram_state>(m_save);
++		save_error error = state->save();
++
++		// validate the state and append
++		if (error == save_error::STATERR_NONE)
++			state_list().push_back(std::move(state));
++		else
++			return error;
++	}
++	else
++	{
++		// invalidate the later states, as the current input might have changed
++		for (auto it = state_list().begin() + index; it <= state_list().end(); ++it)
++			it->get()->m_valid = false;
++
++		// update the existing state
++		ram_state *state = state_list().at(index).get();
++		save_error error = state->save();
++		
++		// validate the updated state
++		if (error != save_error::STATERR_NONE)
++			return error;
++	}
++
++	// make sure we still fit
++	check_size();
++
++	return save_error::STATERR_NONE;
++}
++
++
++//-------------------------------------------------
++//  step - single step back in time
++//-------------------------------------------------
++
++save_error rewinder::step()
++{
++	// check presence of states
++	if (state_list().empty())
++		return save_error::STATERR_READ_ERROR;
++
++	// fetch the current state index
++	int index = get_current_index();
++
++	// if there is room, retreat
++	if (index > 0)
++	{
++		// obtain the state pointer
++		ram_state *state = state_list().at(index - 1).get();
++
++		// try to load if it's marked as valid
++		if (state->m_valid)
++		{
++			return state->load();
++		}
++	}
++
++	// no state to load
++	return save_error::STATERR_READ_ERROR;
++}
++
++
++//-------------------------------------------------
+ //  state_entry - constructor
+ //-------------------------------------------------
+ 
+ state_entry::state_entry(void *data, const char *name, device_t *device, const char *module, const char *tag, int index, u8 size, u32 count)
+-	: m_data(data),
+-		m_name(name),
+-		m_device(device),
+-		m_module(module),
+-		m_tag(tag),
+-		m_index(index),
+-		m_typesize(size),
+-		m_typecount(count),
+-		m_offset(0)
++	: m_data(data)
++	, m_name(name)
++	, m_device(device)
++	, m_module(module)
++	, m_tag(tag)
++	, m_index(index)
++	, m_typesize(size)
++	, m_typecount(count)
++	, m_offset(0)
+ {
+ }
+ 
+ 
+ //-------------------------------------------------
+ //  flip_data - reverse the endianness of a
+-//  block of  data
++//  block of data
+ //-------------------------------------------------
+ 
+ void state_entry::flip_data()
+diff --git a/src/emu/save.h b/src/emu/save.h
+index 4f11279..5ef5f2c 100644
+--- a/src/emu/save.h
++++ b/src/emu/save.h
+@@ -85,12 +85,16 @@ class save_manager
+ 	template<typename _ItemType> struct type_checker { static const bool is_atom = false; static const bool is_pointer = false; };
+ 	template<typename _ItemType> struct type_checker<_ItemType*> { static const bool is_atom = false; static const bool is_pointer = true; };
+ 
++	friend class ram_state;
++	friend class rewinder;
++
+ public:
+ 	// construction/destruction
+ 	save_manager(running_machine &machine);
+ 
+ 	// getters
+ 	running_machine &machine() const { return m_machine; }
++	rewinder *rewind() { return m_rewind.get(); }
+ 	int registration_count() const { return m_entry_list.size(); }
+ 	bool registration_allowed() const { return m_reg_allowed; }
+ 
+@@ -170,15 +174,46 @@ private:
+ 	};
+ 
+ 	// internal state
+-	running_machine &       m_machine;              // reference to our machine
+-	bool                    m_reg_allowed;          // are registrations allowed?
+-	int                     m_illegal_regs;         // number of illegal registrations
++	running_machine &         m_machine;              // reference to our machine
++	std::unique_ptr<rewinder> m_rewind;               // rewinder
++	bool                      m_reg_allowed;          // are registrations allowed?
++	int                       m_illegal_regs;         // number of illegal registrations
+ 
+-	std::vector<std::unique_ptr<state_entry>> m_entry_list;          // list of registered entries
++	std::vector<std::unique_ptr<state_entry>>    m_entry_list;       // list of registered entries
++	std::vector<std::unique_ptr<ram_state>>      m_ramstate_list;    // list of ram states
+ 	std::vector<std::unique_ptr<state_callback>> m_presave_list;     // list of pre-save functions
+ 	std::vector<std::unique_ptr<state_callback>> m_postload_list;    // list of post-load functions
+ };
+ 
++class ram_state
++{
++	save_manager &m_save;
++	util::vectorstream m_data;
++
++public:
++	bool m_valid;
++	attotime m_time;
++
++	ram_state(save_manager &save);
++	static size_t get_size(save_manager &save);
++	save_error save();
++	save_error load();
++};
++
++class rewinder {
++	save_manager &m_save;
++	uint32_t m_capacity;
++
++	std::vector<std::unique_ptr<ram_state>> &state_list() { return m_save.m_ramstate_list; }
++	int get_current_index();
++	void check_size();
++
++public:
++	rewinder(save_manager &save);
++	save_error capture();
++	save_error step();
++};
++
+ 
+ // template specializations to enumerate the fundamental atomic types you are allowed to save
+ ALLOW_SAVE_TYPE_AND_ARRAY(char)
+diff --git a/src/frontend/mame/ui/ui.cpp b/src/frontend/mame/ui/ui.cpp
+index 4b57049..963ecf4 100644
+--- a/src/frontend/mame/ui/ui.cpp
++++ b/src/frontend/mame/ui/ui.cpp
+@@ -1209,10 +1209,17 @@ uint32_t mame_ui_manager::handler_ingame(render_container &container)
+ 	// pause single step
+ 	if (machine().ui_input().pressed(IPT_UI_PAUSE_SINGLE))
+ 	{
++		machine().save().rewind()->capture();
+ 		set_single_step(true);
+ 		machine().resume();
+ 	}
+ 
++	// rewind single step
++	if (machine().ui_input().pressed(IPT_UI_REWIND_SINGLE))
++	{
++		machine().save().rewind()->step();
++	}
++
+ 	// handle a toggle cheats request
+ 	if (machine().ui_input().pressed(IPT_UI_TOGGLE_CHEAT))
+ 		mame_machine_manager::instance()->cheat().set_enable(!mame_machine_manager::instance()->cheat().enabled());
