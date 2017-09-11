@@ -1,9 +1,9 @@
  src/emu/inpttype.h          |   7 +-
  src/emu/ioport.h            |   1 +
- src/emu/save.cpp            | 295 +++++++++++++++++++++++++++++++++++++++++---
- src/emu/save.h              |  43 ++++++-
- src/frontend/mame/ui/ui.cpp |   7 ++
- 5 files changed, 328 insertions(+), 25 deletions(-)
+ src/emu/save.cpp            | 368 +++++++++++++++++++++++++++++++++++++++++---
+ src/emu/save.h              |  51 +++++-
+ src/frontend/mame/ui/ui.cpp |   7 +
+ 5 files changed, 409 insertions(+), 25 deletions(-)
 
 diff --git a/src/emu/inpttype.h b/src/emu/inpttype.h
 index 7169c6f..182407f 100644
@@ -38,7 +38,7 @@ index 7b434c5..6a72bdd 100644
  		IPT_UI_SOFT_RESET,
  		IPT_UI_SHOW_GFX,
 diff --git a/src/emu/save.cpp b/src/emu/save.cpp
-index c85f0d1..a4d69d8 100644
+index c85f0d1..31fce4b 100644
 --- a/src/emu/save.cpp
 +++ b/src/emu/save.cpp
 @@ -60,10 +60,11 @@ enum
@@ -118,7 +118,7 @@ index c85f0d1..a4d69d8 100644
  //-------------------------------------------------
  //  write_file - writes the data to a file
  //-------------------------------------------------
-@@ -415,26 +418,282 @@ save_manager::state_callback::state_callback(save_prepost_delegate callback)
+@@ -415,26 +418,355 @@ save_manager::state_callback::state_callback(save_prepost_delegate callback)
  
  
  //-------------------------------------------------
@@ -251,6 +251,7 @@ index c85f0d1..a4d69d8 100644
 +rewinder::rewinder(save_manager &save)
 +	: m_save(save)
 +	, m_capacity(100)
++	, m_size(0)
 +{
 +}
 +
@@ -289,7 +290,7 @@ index c85f0d1..a4d69d8 100644
 +	while (state_list().size() + 1 > m_capacity)
 +	{
 +		// default to the last invalid state
-+		auto it = state_list().end();
++		auto it = state_list().end() - 1;
 +
 +		// if the last state is valid, drop the oldest one instead
 +		if (it->get()->m_valid)
@@ -301,10 +302,59 @@ index c85f0d1..a4d69d8 100644
 +
 +
 +//-------------------------------------------------
++//  report_error - report rewind success or
++//  error type
++//-------------------------------------------------
++
++void rewinder::report_error(save_error error, rewind_operation operation, int index)
++{
++	const char *const opname = (operation == rewind_operation::LOAD) ? "load" : "save";
++
++	switch (error)
++	{
++	case STATERR_ILLEGAL_REGISTRATIONS:
++		m_save.machine().popmessage("Error: Unable to %s state due to illegal registrations. See error.log for details.", opname);
++		break;
++
++	case STATERR_INVALID_HEADER:
++		m_save.machine().popmessage("Error: Unable to %s state due to an invalid header. Make sure the save state is correct for this machine.", opname);
++		break;
++
++	case STATERR_READ_ERROR:
++		m_save.machine().popmessage("Error: Unable to %s state due to a read error.", opname);
++		break;
++
++	case STATERR_WRITE_ERROR:
++		m_save.machine().popmessage("Error: Unable to %s state due to a write error.", opname);
++		break;
++
++	case STATERR_NONE:
++		if (m_size > 0)
++		{
++			const char *const warning = (m_save.machine().system().flags & MACHINE_SUPPORTS_SAVE) ? ""
++				: " Warning: Save states are not officially supported for this machine.";
++
++			if (operation == rewind_operation::SAVE)
++				m_save.machine().popmessage("Rewind state captured. Rewind buffer size: %i.%s", m_size, warning);
++			else if (index > 0)
++				m_save.machine().popmessage("Rewind state %i/%i loaded.%s", index, m_size, warning);
++		}
++		else if (operation == rewind_operation::LOAD)
++			m_save.machine().popmessage("No rewind state to load.");
++		break;
++
++	default:
++		m_save.machine().popmessage("Error: Unknown error during state %s.", opname);
++		break;
++	}
++}
++
++
++//-------------------------------------------------
 +//  capture - record a single state
 +//-------------------------------------------------
 +
-+save_error rewinder::capture()
++void rewinder::capture()
 +{
 +	// fetch the current machine time
 +	attotime curtime = m_save.machine().time();
@@ -318,31 +368,47 @@ index c85f0d1..a4d69d8 100644
 +		std::unique_ptr<ram_state> state = std::make_unique<ram_state>(m_save);
 +		save_error error = state->save();
 +
-+		// validate the state and append
-+		if (error == save_error::STATERR_NONE)
++		// validate the state
++		if (error == STATERR_NONE)
++		{
++			// append
 +			state_list().push_back(std::move(state));
++
++			// all states are valid
++			m_size = state_list().size();
++		}
 +		else
-+			return error;
++		{
++			report_error(error, rewind_operation::SAVE);
++			return;
++		}
 +	}
 +	else
 +	{
 +		// invalidate the later states, as the current input might have changed
-+		for (auto it = state_list().begin() + index; it <= state_list().end(); ++it)
++		for (auto it = state_list().begin() + index; it < state_list().end(); ++it)
 +			it->get()->m_valid = false;
++
++		// states after index are invalid
++		m_size = index;
 +
 +		// update the existing state
 +		ram_state *state = state_list().at(index).get();
 +		save_error error = state->save();
 +		
 +		// validate the updated state
-+		if (error != save_error::STATERR_NONE)
-+			return error;
++		if (error != STATERR_NONE)
++		{
++			report_error(error, rewind_operation::SAVE);
++			return;
++		}
 +	}
 +
 +	// make sure we still fit
 +	check_size();
 +
-+	return save_error::STATERR_NONE;
++	// success
++	report_error(STATERR_NONE, rewind_operation::SAVE);
 +}
 +
 +
@@ -350,30 +416,37 @@ index c85f0d1..a4d69d8 100644
 +//  step - single step back in time
 +//-------------------------------------------------
 +
-+save_error rewinder::step()
++void rewinder::step()
 +{
 +	// check presence of states
 +	if (state_list().empty())
-+		return save_error::STATERR_READ_ERROR;
++	{
++		report_error(STATERR_NONE, rewind_operation::LOAD);
++		return;
++	}
 +
 +	// fetch the current state index
 +	int index = get_current_index();
 +
 +	// if there is room, retreat
-+	if (index > 0)
++	if (index != 0)
 +	{
++		// we may be on top of the list
++		if (index == -1)
++			index = m_size;
++
 +		// obtain the state pointer
 +		ram_state *state = state_list().at(index - 1).get();
 +
 +		// try to load if it's marked as valid
 +		if (state->m_valid)
 +		{
-+			return state->load();
++			report_error(state->load(), rewind_operation::LOAD, index - 1);
++			return;
 +		}
 +	}
 +
-+	// no state to load
-+	return save_error::STATERR_READ_ERROR;
++	report_error(STATERR_NONE, rewind_operation::LOAD);
 +}
 +
 +
@@ -412,7 +485,7 @@ index c85f0d1..a4d69d8 100644
  
  void state_entry::flip_data()
 diff --git a/src/emu/save.h b/src/emu/save.h
-index 4f11279..5ef5f2c 100644
+index 4f11279..abd28f0 100644
 --- a/src/emu/save.h
 +++ b/src/emu/save.h
 @@ -85,12 +85,16 @@ class save_manager
@@ -432,7 +505,7 @@ index 4f11279..5ef5f2c 100644
  	int registration_count() const { return m_entry_list.size(); }
  	bool registration_allowed() const { return m_reg_allowed; }
  
-@@ -170,15 +174,46 @@ private:
+@@ -170,15 +174,54 @@ private:
  	};
  
  	// internal state
@@ -468,16 +541,24 @@ index 4f11279..5ef5f2c 100644
 +
 +class rewinder {
 +	save_manager &m_save;
-+	uint32_t m_capacity;
++	uint32_t m_capacity;   // imposed limit of total states
++	uint32_t m_size;       // amount of valid states only
++
++	enum class rewind_operation
++	{
++		SAVE,
++		LOAD
++	};
 +
 +	std::vector<std::unique_ptr<ram_state>> &state_list() { return m_save.m_ramstate_list; }
 +	int get_current_index();
 +	void check_size();
++	void report_error(save_error type, rewind_operation operation, int index = 0);
 +
 +public:
 +	rewinder(save_manager &save);
-+	save_error capture();
-+	save_error step();
++	void capture();
++	void step();
 +};
 +
  
