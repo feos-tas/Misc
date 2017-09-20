@@ -1,9 +1,9 @@
  src/emu/inpttype.h          |   7 +-
  src/emu/ioport.h            |   1 +
- src/emu/save.cpp            | 368 +++++++++++++++++++++++++++++++++++++++++---
- src/emu/save.h              |  51 +++++-
+ src/emu/save.cpp            | 374 +++++++++++++++++++++++++++++++++++++++++---
+ src/emu/save.h              |  54 ++++++-
  src/frontend/mame/ui/ui.cpp |   7 +
- 5 files changed, 409 insertions(+), 25 deletions(-)
+ 5 files changed, 417 insertions(+), 26 deletions(-)
 
 diff --git a/src/emu/inpttype.h b/src/emu/inpttype.h
 index 7169c6f..182407f 100644
@@ -38,7 +38,7 @@ index 7b434c5..6a72bdd 100644
  		IPT_UI_SOFT_RESET,
  		IPT_UI_SHOW_GFX,
 diff --git a/src/emu/save.cpp b/src/emu/save.cpp
-index c85f0d1..31fce4b 100644
+index c85f0d1..72b12ea 100644
 --- a/src/emu/save.cpp
 +++ b/src/emu/save.cpp
 @@ -60,10 +60,11 @@ enum
@@ -118,7 +118,7 @@ index c85f0d1..31fce4b 100644
  //-------------------------------------------------
  //  write_file - writes the data to a file
  //-------------------------------------------------
-@@ -415,26 +418,355 @@ save_manager::state_callback::state_callback(save_prepost_delegate callback)
+@@ -415,26 +418,361 @@ save_manager::state_callback::state_callback(save_prepost_delegate callback)
  
  
  //-------------------------------------------------
@@ -263,16 +263,17 @@ index c85f0d1..31fce4b 100644
 +
 +int rewinder::get_current_index()
 +{
-+	if (state_list().empty())
++	// nowhere to search
++	if (m_state_list.empty())
 +		return -1;
 +
 +	// fetch the current machine time
 +	attotime curtime = m_save.machine().time();
 +
 +	// find the state at the current time, or at least the first one after
-+	for (auto it = state_list().begin(); it < state_list().end(); ++it)
++	for (auto it = m_state_list.begin(); it < m_state_list.end(); ++it)
 +		if (it->get()->m_time >= curtime)
-+			return it - state_list().begin();
++			return it - m_state_list.begin();
 +
 +	// no state matches the criterion
 +	return -1;
@@ -287,16 +288,17 @@ index c85f0d1..31fce4b 100644
 +void rewinder::check_size()
 +{
 +	// continuously drop states while we are beyond capacity
-+	while (state_list().size() + 1 > m_capacity)
++	while (m_state_list.size() + 1 > m_capacity)
 +	{
 +		// default to the last invalid state
-+		auto it = state_list().end() - 1;
++		auto it = m_state_list.end() - 1;
 +
-+		// if the last state is valid, drop the oldest one instead
++		// if the last state is valid, pick the oldest one instead
 +		if (it->get()->m_valid)
-+			it = state_list().begin();
++			it = m_state_list.begin();
 +
-+		state_list().erase(it);
++		// drop it from the list
++		m_state_list.erase(it);
 +	}
 +}
 +
@@ -371,14 +373,15 @@ index c85f0d1..31fce4b 100644
 +		// validate the state
 +		if (error == STATERR_NONE)
 +		{
-+			// append
-+			state_list().push_back(std::move(state));
++			// append to the list
++			m_state_list.push_back(std::move(state));
 +
-+			// all states are valid
-+			m_size = state_list().size();
++			// all states are known to be valid
++			m_size = m_state_list.size();
 +		}
 +		else
 +		{
++			// tell the error to the user
 +			report_error(error, rewind_operation::SAVE);
 +			return;
 +		}
@@ -386,19 +389,20 @@ index c85f0d1..31fce4b 100644
 +	else
 +	{
 +		// invalidate the later states, as the current input might have changed
-+		for (auto it = state_list().begin() + index; it < state_list().end(); ++it)
++		for (auto it = m_state_list.begin() + index; it < m_state_list.end(); ++it)
 +			it->get()->m_valid = false;
 +
 +		// states after index are invalid
 +		m_size = index;
 +
 +		// update the existing state
-+		ram_state *state = state_list().at(index).get();
++		ram_state *state = m_state_list.at(index).get();
 +		save_error error = state->save();
 +		
 +		// validate the updated state
 +		if (error != STATERR_NONE)
 +		{
++			// tell the error to the user
 +			report_error(error, rewind_operation::SAVE);
 +			return;
 +		}
@@ -407,7 +411,7 @@ index c85f0d1..31fce4b 100644
 +	// make sure we still fit
 +	check_size();
 +
-+	// success
++	// report success
 +	report_error(STATERR_NONE, rewind_operation::SAVE);
 +}
 +
@@ -419,8 +423,9 @@ index c85f0d1..31fce4b 100644
 +void rewinder::step()
 +{
 +	// check presence of states
-+	if (state_list().empty())
++	if (m_state_list.empty())
 +	{
++		// inform the user
 +		report_error(STATERR_NONE, rewind_operation::LOAD);
 +		return;
 +	}
@@ -433,10 +438,11 @@ index c85f0d1..31fce4b 100644
 +	{
 +		// we may be on top of the list
 +		if (index == -1)
++			// all states are valid
 +			index = m_size;
 +
 +		// obtain the state pointer
-+		ram_state *state = state_list().at(index - 1).get();
++		ram_state *state = m_state_list.at(index - 1).get();
 +
 +		// try to load if it's marked as valid
 +		if (state->m_valid)
@@ -485,7 +491,7 @@ index c85f0d1..31fce4b 100644
  
  void state_entry::flip_data()
 diff --git a/src/emu/save.h b/src/emu/save.h
-index 4f11279..abd28f0 100644
+index 4f11279..5584643 100644
 --- a/src/emu/save.h
 +++ b/src/emu/save.h
 @@ -85,12 +85,16 @@ class save_manager
@@ -505,7 +511,12 @@ index 4f11279..abd28f0 100644
  	int registration_count() const { return m_entry_list.size(); }
  	bool registration_allowed() const { return m_reg_allowed; }
  
-@@ -170,15 +174,54 @@ private:
+@@ -166,19 +170,59 @@ private:
+ 		// construction/destruction
+ 		state_callback(save_prepost_delegate callback);
+ 
+-		save_prepost_delegate m_func;               // delegate
++		save_prepost_delegate m_func;                 // delegate
  	};
  
  	// internal state
@@ -526,12 +537,12 @@ index 4f11279..abd28f0 100644
  
 +class ram_state
 +{
-+	save_manager &m_save;
-+	util::vectorstream m_data;
++	save_manager &     m_save;  // reference to save_manager
++	util::vectorstream m_data;  // save data buffer
 +
 +public:
-+	bool m_valid;
-+	attotime m_time;
++	bool               m_valid; // can we load this state?
++	attotime           m_time;  // machine timestamp
 +
 +	ram_state(save_manager &save);
 +	static size_t get_size(save_manager &save);
@@ -540,17 +551,18 @@ index 4f11279..abd28f0 100644
 +};
 +
 +class rewinder {
-+	save_manager &m_save;
-+	uint32_t m_capacity;   // imposed limit of total states
-+	uint32_t m_size;       // amount of valid states only
++	save_manager &                          m_save;       // reference to save_manager
++	uint32_t                                m_capacity;   // imposed limit of total states
++	uint32_t                                m_size;       // amount of valid states
++	std::vector<std::unique_ptr<ram_state>> m_state_list; // rewinder's own ram states
 +
++	// load/save management
 +	enum class rewind_operation
 +	{
 +		SAVE,
 +		LOAD
 +	};
-+
-+	std::vector<std::unique_ptr<ram_state>> &state_list() { return m_save.m_ramstate_list; }
++	
 +	int get_current_index();
 +	void check_size();
 +	void report_error(save_error type, rewind_operation operation, int index = 0);
