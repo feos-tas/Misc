@@ -1,9 +1,10 @@
  src/emu/inpttype.h          |   7 +-
  src/emu/ioport.h            |   1 +
- src/emu/save.cpp            | 374 +++++++++++++++++++++++++++++++++++++++++---
- src/emu/save.h              |  54 ++++++-
+ src/emu/machine.cpp         |   3 +
+ src/emu/save.cpp            | 401 ++++++++++++++++++++++++++++++++++++++++++--
+ src/emu/save.h              |  56 ++++++-
  src/frontend/mame/ui/ui.cpp |   7 +
- 5 files changed, 417 insertions(+), 26 deletions(-)
+ 6 files changed, 449 insertions(+), 26 deletions(-)
 
 diff --git a/src/emu/inpttype.h b/src/emu/inpttype.h
 index 7169c6f..182407f 100644
@@ -37,8 +38,23 @@ index 7b434c5..6a72bdd 100644
  		IPT_UI_RESET_MACHINE,
  		IPT_UI_SOFT_RESET,
  		IPT_UI_SHOW_GFX,
+diff --git a/src/emu/machine.cpp b/src/emu/machine.cpp
+index 6712951..50b737a 100644
+--- a/src/emu/machine.cpp
++++ b/src/emu/machine.cpp
+@@ -723,7 +723,10 @@ void running_machine::resume()
+ void running_machine::toggle_pause()
+ {
+ 	if (paused())
++	{
++		m_save.rewind()->invalidate();
+ 		resume();
++	}
+ 	else
+ 		pause();
+ }
 diff --git a/src/emu/save.cpp b/src/emu/save.cpp
-index c85f0d1..72b12ea 100644
+index c85f0d1..b09cad1 100644
 --- a/src/emu/save.cpp
 +++ b/src/emu/save.cpp
 @@ -60,10 +60,11 @@ enum
@@ -118,7 +134,7 @@ index c85f0d1..72b12ea 100644
  //-------------------------------------------------
  //  write_file - writes the data to a file
  //-------------------------------------------------
-@@ -415,26 +418,361 @@ save_manager::state_callback::state_callback(save_prepost_delegate callback)
+@@ -415,26 +418,388 @@ save_manager::state_callback::state_callback(save_prepost_delegate callback)
  
  
  //-------------------------------------------------
@@ -178,6 +194,10 @@ index c85f0d1..72b12ea 100644
 +	// write the header
 +	m_data.write((char *)header, sizeof(header));
 +
++	// check for any errors
++	if (!m_data)
++		return STATERR_READ_ERROR;
++
 +	// call the pre-save functions
 +	m_save.dispatch_presave();
 +
@@ -213,6 +233,10 @@ index c85f0d1..72b12ea 100644
 +	// read the header
 +	u8 header[HEADER_SIZE];
 +	m_data.read((char *)header, sizeof(header));
++
++	// check for any errors
++	if (!m_data)
++		return STATERR_READ_ERROR;
 +
 +	// verify the header and report an error if it doesn't match
 +	u32 sig = m_save.signature();
@@ -253,30 +277,6 @@ index c85f0d1..72b12ea 100644
 +	, m_capacity(100)
 +	, m_size(0)
 +{
-+}
-+
-+
-+//-------------------------------------------------
-+//  get_current_index - get the index of the
-+//  state to assume as current
-+//-------------------------------------------------
-+
-+int rewinder::get_current_index()
-+{
-+	// nowhere to search
-+	if (m_state_list.empty())
-+		return -1;
-+
-+	// fetch the current machine time
-+	attotime curtime = m_save.machine().time();
-+
-+	// find the state at the current time, or at least the first one after
-+	for (auto it = m_state_list.begin(); it < m_state_list.end(); ++it)
-+		if (it->get()->m_time >= curtime)
-+			return it - m_state_list.begin();
-+
-+	// no state matches the criterion
-+	return -1;
 +}
 +
 +
@@ -330,19 +330,21 @@ index c85f0d1..72b12ea 100644
 +		m_save.machine().popmessage("Error: Unable to %s state due to a write error.", opname);
 +		break;
 +
++	case STATERR_NOT_FOUND:
++		if (operation == rewind_operation::LOAD)
++			m_save.machine().popmessage("No rewind state to load.");
++		break;
++
 +	case STATERR_NONE:
-+		if (m_size > 0)
 +		{
 +			const char *const warning = (m_save.machine().system().flags & MACHINE_SUPPORTS_SAVE) ? ""
 +				: " Warning: Save states are not officially supported for this machine.";
 +
 +			if (operation == rewind_operation::SAVE)
 +				m_save.machine().popmessage("Rewind state captured. Rewind buffer size: %i.%s", m_size, warning);
-+			else if (index > 0)
++			else
 +				m_save.machine().popmessage("Rewind state %i/%i loaded.%s", index, m_size, warning);
 +		}
-+		else if (operation == rewind_operation::LOAD)
-+			m_save.machine().popmessage("No rewind state to load.");
 +		break;
 +
 +	default:
@@ -353,16 +355,62 @@ index c85f0d1..72b12ea 100644
 +
 +
 +//-------------------------------------------------
++//  get_current_index - get the index of the
++//  state to assume as current
++//-------------------------------------------------
++
++int rewinder::get_current_index()
++{
++	// nowhere to search
++	if (m_state_list.empty())
++		return -1;
++
++	// fetch the current machine time
++	attotime curtime = m_save.machine().time();
++
++	// find the state at the current time, or at least the first one after
++	for (auto it = m_state_list.begin(); it < m_state_list.end(); ++it)
++		if (it->get()->m_time >= curtime)
++			return it - m_state_list.begin();
++
++	// no state matches the criterion
++	return -1;
++}
++
++
++//-------------------------------------------------
++//  invalidate - mark the states after current
++//  as invalid
++//-------------------------------------------------
++
++int rewinder::invalidate()
++{
++	// fetch the current state index
++	int index = get_current_index();
++
++	if (index != -1)
++	{
++		// invalidate the later states, as the current input might have changed
++		for (auto it = m_state_list.begin() + index + 1; it < m_state_list.end(); ++it)
++			it->get()->m_valid = false;
++
++		// states after index are invalid
++		m_size = index + 1;
++	}
++
++	// index of the last valid state
++	return index;
++}
++
++
++//-------------------------------------------------
 +//  capture - record a single state
 +//-------------------------------------------------
 +
 +void rewinder::capture()
 +{
-+	// fetch the current machine time
-+	attotime curtime = m_save.machine().time();
-+
 +	// fetch the current state index
-+	int index = get_current_index();
++	int index = invalidate();
 +
 +	if (index == -1)
 +	{
@@ -388,13 +436,6 @@ index c85f0d1..72b12ea 100644
 +	}
 +	else
 +	{
-+		// invalidate the later states, as the current input might have changed
-+		for (auto it = m_state_list.begin() + index; it < m_state_list.end(); ++it)
-+			it->get()->m_valid = false;
-+
-+		// states after index are invalid
-+		m_size = index;
-+
 +		// update the existing state
 +		ram_state *state = m_state_list.at(index).get();
 +		save_error error = state->save();
@@ -425,8 +466,8 @@ index c85f0d1..72b12ea 100644
 +	// check presence of states
 +	if (m_state_list.empty())
 +	{
-+		// inform the user
-+		report_error(STATERR_NONE, rewind_operation::LOAD);
++		// inform the user about the lack of states
++		report_error(STATERR_NOT_FOUND, rewind_operation::LOAD);
 +		return;
 +	}
 +
@@ -447,12 +488,14 @@ index c85f0d1..72b12ea 100644
 +		// try to load if it's marked as valid
 +		if (state->m_valid)
 +		{
++			// report the result
 +			report_error(state->load(), rewind_operation::LOAD, index - 1);
 +			return;
 +		}
 +	}
 +
-+	report_error(STATERR_NONE, rewind_operation::LOAD);
++	// inform the user about the lack of states
++	report_error(STATERR_NOT_FOUND, rewind_operation::LOAD);
 +}
 +
 +
@@ -491,10 +534,18 @@ index c85f0d1..72b12ea 100644
  
  void state_entry::flip_data()
 diff --git a/src/emu/save.h b/src/emu/save.h
-index 4f11279..5584643 100644
+index 4f11279..154f3bd 100644
 --- a/src/emu/save.h
 +++ b/src/emu/save.h
-@@ -85,12 +85,16 @@ class save_manager
+@@ -26,6 +26,7 @@
+ enum save_error
+ {
+ 	STATERR_NONE,
++	STATERR_NOT_FOUND,
+ 	STATERR_ILLEGAL_REGISTRATIONS,
+ 	STATERR_INVALID_HEADER,
+ 	STATERR_READ_ERROR,
+@@ -85,12 +86,16 @@ class save_manager
  	template<typename _ItemType> struct type_checker { static const bool is_atom = false; static const bool is_pointer = false; };
  	template<typename _ItemType> struct type_checker<_ItemType*> { static const bool is_atom = false; static const bool is_pointer = true; };
  
@@ -511,7 +562,7 @@ index 4f11279..5584643 100644
  	int registration_count() const { return m_entry_list.size(); }
  	bool registration_allowed() const { return m_reg_allowed; }
  
-@@ -166,19 +170,59 @@ private:
+@@ -166,19 +171,60 @@ private:
  		// construction/destruction
  		state_callback(save_prepost_delegate callback);
  
@@ -569,6 +620,7 @@ index 4f11279..5584643 100644
 +
 +public:
 +	rewinder(save_manager &save);
++	int invalidate();
 +	void capture();
 +	void step();
 +};
