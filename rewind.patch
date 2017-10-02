@@ -1,10 +1,10 @@
  src/emu/inpttype.h          |   7 +-
  src/emu/ioport.h            |   1 +
  src/emu/machine.cpp         |   3 +
- src/emu/save.cpp            | 401 ++++++++++++++++++++++++++++++++++++++++++--
- src/emu/save.h              |  56 ++++++-
+ src/emu/save.cpp            | 443 ++++++++++++++++++++++++++++++++++++++++++--
+ src/emu/save.h              |  57 +++++-
  src/frontend/mame/ui/ui.cpp |   7 +
- 6 files changed, 449 insertions(+), 26 deletions(-)
+ 6 files changed, 492 insertions(+), 26 deletions(-)
 
 diff --git a/src/emu/inpttype.h b/src/emu/inpttype.h
 index 7169c6f..182407f 100644
@@ -54,7 +54,7 @@ index 6712951..50b737a 100644
  		pause();
  }
 diff --git a/src/emu/save.cpp b/src/emu/save.cpp
-index c85f0d1..b09cad1 100644
+index c85f0d1..dcd492d 100644
 --- a/src/emu/save.cpp
 +++ b/src/emu/save.cpp
 @@ -60,10 +60,11 @@ enum
@@ -134,7 +134,7 @@ index c85f0d1..b09cad1 100644
  //-------------------------------------------------
  //  write_file - writes the data to a file
  //-------------------------------------------------
-@@ -415,26 +418,388 @@ save_manager::state_callback::state_callback(save_prepost_delegate callback)
+@@ -415,26 +418,430 @@ save_manager::state_callback::state_callback(save_prepost_delegate callback)
  
  
  //-------------------------------------------------
@@ -362,7 +362,7 @@ index c85f0d1..b09cad1 100644
 +int rewinder::get_current_index()
 +{
 +	// nowhere to search
-+	if (m_state_list.empty())
++	if (m_size == 0)
 +		return -1;
 +
 +	// fetch the current machine time
@@ -373,8 +373,35 @@ index c85f0d1..b09cad1 100644
 +		if (it->get()->m_time >= curtime)
 +			return it - m_state_list.begin();
 +
-+	// no state matches the criterion
++	// all states are older
 +	return -1;
++}
++
++
++//-------------------------------------------------
++//  get_last_valid_index - get the index of the
++//  last valid state before the given index
++//-------------------------------------------------
++
++int rewinder::get_last_valid_index(int index)
++{
++	if (index >= m_state_list.size())
++		index = m_state_list.size() - 1;
++
++	// obtain the state pointer
++	ram_state *state = m_state_list.at(index--).get();
++
++	// cycle through earlier states if we have to
++	while (!state->m_valid)
++	{
++		if (index <= 0)
++			// no valid states found
++			return -1;
++
++		state = m_state_list.at(index--).get();
++	}
++
++	return index;
 +}
 +
 +
@@ -394,8 +421,13 @@ index c85f0d1..b09cad1 100644
 +		for (auto it = m_state_list.begin() + index + 1; it < m_state_list.end(); ++it)
 +			it->get()->m_valid = false;
 +
-+		// states after index are invalid
-+		m_size = index + 1;
++		// more invalid states may be farther back, account for them too
++		index = get_last_valid_index(index);
++
++		if (index > -1)
++			m_size = index;
++		else
++			m_size = 0;
 +	}
 +
 +	// index of the last valid state
@@ -475,21 +507,31 @@ index c85f0d1..b09cad1 100644
 +	int index = get_current_index();
 +
 +	// if there is room, retreat
-+	if (index != 0)
++	if (index != 0 && m_size > 0)
 +	{
 +		// we may be on top of the list
 +		if (index == -1)
 +			// all states are valid
-+			index = m_size;
++			index = m_size - 1;
 +
 +		// obtain the state pointer
-+		ram_state *state = m_state_list.at(index - 1).get();
++		ram_state *state = m_state_list.at(--index).get();
++
++		// cycle through earlier states if we have to
++		while (!state->m_valid)
++		{
++			if (index <= 0)
++				// no valid states found
++				report_error(STATERR_NOT_FOUND, rewind_operation::LOAD);
++
++			state = m_state_list.at(--index).get();
++		}
 +
 +		// try to load if it's marked as valid
 +		if (state->m_valid)
 +		{
 +			// report the result
-+			report_error(state->load(), rewind_operation::LOAD, index - 1);
++			report_error(state->load(), rewind_operation::LOAD, index);
 +			return;
 +		}
 +	}
@@ -534,7 +576,7 @@ index c85f0d1..b09cad1 100644
  
  void state_entry::flip_data()
 diff --git a/src/emu/save.h b/src/emu/save.h
-index 4f11279..154f3bd 100644
+index 4f11279..48cb7ba 100644
 --- a/src/emu/save.h
 +++ b/src/emu/save.h
 @@ -26,6 +26,7 @@
@@ -562,7 +604,7 @@ index 4f11279..154f3bd 100644
  	int registration_count() const { return m_entry_list.size(); }
  	bool registration_allowed() const { return m_reg_allowed; }
  
-@@ -166,19 +171,60 @@ private:
+@@ -166,19 +171,61 @@ private:
  		// construction/destruction
  		state_callback(save_prepost_delegate callback);
  
@@ -615,6 +657,7 @@ index 4f11279..154f3bd 100644
 +	};
 +	
 +	int get_current_index();
++	int get_last_valid_index(int index);
 +	void check_size();
 +	void report_error(save_error type, rewind_operation operation, int index = 0);
 +
