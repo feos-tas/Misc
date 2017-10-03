@@ -1,10 +1,10 @@
  src/emu/inpttype.h          |   7 +-
  src/emu/ioport.h            |   1 +
  src/emu/machine.cpp         |   3 +
- src/emu/save.cpp            | 443 ++++++++++++++++++++++++++++++++++++++++++--
- src/emu/save.h              |  57 +++++-
+ src/emu/save.cpp            | 416 ++++++++++++++++++++++++++++++++++++++++++--
+ src/emu/save.h              |  56 +++++-
  src/frontend/mame/ui/ui.cpp |   7 +
- 6 files changed, 492 insertions(+), 26 deletions(-)
+ 6 files changed, 464 insertions(+), 26 deletions(-)
 
 diff --git a/src/emu/inpttype.h b/src/emu/inpttype.h
 index 7169c6f..182407f 100644
@@ -54,7 +54,7 @@ index 6712951..50b737a 100644
  		pause();
  }
 diff --git a/src/emu/save.cpp b/src/emu/save.cpp
-index c85f0d1..dcd492d 100644
+index c85f0d1..3a9c897 100644
 --- a/src/emu/save.cpp
 +++ b/src/emu/save.cpp
 @@ -60,10 +60,11 @@ enum
@@ -134,7 +134,7 @@ index c85f0d1..dcd492d 100644
  //-------------------------------------------------
  //  write_file - writes the data to a file
  //-------------------------------------------------
-@@ -415,26 +418,430 @@ save_manager::state_callback::state_callback(save_prepost_delegate callback)
+@@ -415,26 +418,403 @@ save_manager::state_callback::state_callback(save_prepost_delegate callback)
  
  
  //-------------------------------------------------
@@ -275,7 +275,6 @@ index c85f0d1..dcd492d 100644
 +rewinder::rewinder(save_manager &save)
 +	: m_save(save)
 +	, m_capacity(100)
-+	, m_size(0)
 +{
 +}
 +
@@ -287,18 +286,13 @@ index c85f0d1..dcd492d 100644
 +
 +void rewinder::check_size()
 +{
-+	// continuously drop states while we are beyond capacity
-+	while (m_state_list.size() + 1 > m_capacity)
++	if (m_state_list.size() + 1 == m_capacity)
 +	{
-+		// default to the last invalid state
-+		auto it = m_state_list.end() - 1;
-+
-+		// if the last state is valid, pick the oldest one instead
-+		if (it->get()->m_valid)
-+			it = m_state_list.begin();
-+
++		ram_state *state = m_state_list.begin()->get();
++		state->m_valid = false;
++		m_state_list.push_back(std::move(state));
 +		// drop it from the list
-+		m_state_list.erase(it);
++		m_state_list.erase(state);
 +	}
 +}
 +
@@ -341,9 +335,9 @@ index c85f0d1..dcd492d 100644
 +				: " Warning: Save states are not officially supported for this machine.";
 +
 +			if (operation == rewind_operation::SAVE)
-+				m_save.machine().popmessage("Rewind state captured. Rewind buffer size: %i.%s", m_size, warning);
++				m_save.machine().popmessage("Rewind state captured. Rewind buffer size: %i.%s", get_last_valid_index() + 1, warning);
 +			else
-+				m_save.machine().popmessage("Rewind state %i/%i loaded.%s", index, m_size, warning);
++				m_save.machine().popmessage("Rewind state %i/%i loaded.%s", index, get_last_valid_index() + 1, warning);
 +		}
 +		break;
 +
@@ -362,7 +356,7 @@ index c85f0d1..dcd492d 100644
 +int rewinder::get_current_index()
 +{
 +	// nowhere to search
-+	if (m_size == 0)
++	if (get_first_invalid_index() == 0)
 +		return -1;
 +
 +	// fetch the current machine time
@@ -380,28 +374,17 @@ index c85f0d1..dcd492d 100644
 +
 +//-------------------------------------------------
 +//  get_last_valid_index - get the index of the
-+//  last valid state before the given index
++//  first invalid state
 +//-------------------------------------------------
 +
-+int rewinder::get_last_valid_index(int index)
++int rewinder::get_first_invalid_index()
 +{
-+	if (index >= m_state_list.size())
-+		index = m_state_list.size() - 1;
++	for (auto it = m_state_list.begin(); it < m_state_list.end(); ++it)
++		if (!it->get()->m_valid)
++			return it - m_state_list.begin();
 +
-+	// obtain the state pointer
-+	ram_state *state = m_state_list.at(index--).get();
-+
-+	// cycle through earlier states if we have to
-+	while (!state->m_valid)
-+	{
-+		if (index <= 0)
-+			// no valid states found
-+			return -1;
-+
-+		state = m_state_list.at(index--).get();
-+	}
-+
-+	return index;
++	// all states are valid
++	return -1;
 +}
 +
 +
@@ -422,12 +405,7 @@ index c85f0d1..dcd492d 100644
 +			it->get()->m_valid = false;
 +
 +		// more invalid states may be farther back, account for them too
-+		index = get_last_valid_index(index);
-+
-+		if (index > -1)
-+			m_size = index;
-+		else
-+			m_size = 0;
++		index = get_first_invalid_index();
 +	}
 +
 +	// index of the last valid state
@@ -452,13 +430,8 @@ index c85f0d1..dcd492d 100644
 +
 +		// validate the state
 +		if (error == STATERR_NONE)
-+		{
 +			// append to the list
 +			m_state_list.push_back(std::move(state));
-+
-+			// all states are known to be valid
-+			m_size = m_state_list.size();
-+		}
 +		else
 +		{
 +			// tell the error to the user
@@ -507,7 +480,7 @@ index c85f0d1..dcd492d 100644
 +	int index = get_current_index();
 +
 +	// if there is room, retreat
-+	if (index != 0 && m_size > 0)
++	if (index != 0)
 +	{
 +		// we may be on top of the list
 +		if (index == -1)
@@ -576,7 +549,7 @@ index c85f0d1..dcd492d 100644
  
  void state_entry::flip_data()
 diff --git a/src/emu/save.h b/src/emu/save.h
-index 4f11279..48cb7ba 100644
+index 4f11279..57af709 100644
 --- a/src/emu/save.h
 +++ b/src/emu/save.h
 @@ -26,6 +26,7 @@
@@ -604,7 +577,7 @@ index 4f11279..48cb7ba 100644
  	int registration_count() const { return m_entry_list.size(); }
  	bool registration_allowed() const { return m_reg_allowed; }
  
-@@ -166,19 +171,61 @@ private:
+@@ -166,19 +171,60 @@ private:
  		// construction/destruction
  		state_callback(save_prepost_delegate callback);
  
@@ -646,7 +619,6 @@ index 4f11279..48cb7ba 100644
 +class rewinder {
 +	save_manager &                          m_save;       // reference to save_manager
 +	uint32_t                                m_capacity;   // imposed limit of total states
-+	uint32_t                                m_size;       // amount of valid states
 +	std::vector<std::unique_ptr<ram_state>> m_state_list; // rewinder's own ram states
 +
 +	// load/save management
@@ -657,7 +629,7 @@ index 4f11279..48cb7ba 100644
 +	};
 +	
 +	int get_current_index();
-+	int get_last_valid_index(int index);
++	int get_first_invalid_index();
 +	void check_size();
 +	void report_error(save_error type, rewind_operation operation, int index = 0);
 +
