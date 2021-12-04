@@ -1,0 +1,117 @@
+Index: gpu/gpu_record.cpp
+===================================================================
+--- gpu/gpu_record.cpp	(revision 726)
++++ gpu/gpu_record.cpp	(working copy)
+@@ -76,7 +76,7 @@
+ 	RECORD_TOTAL_BYTES = 0;
+ 	if (RECORD_RECORDING_MODE==0)
+ 	{
+-		sprintf(&filename[0],"%s%s%03d_%s.avi",Movie.AviDrive,Movie.AviDirectory,Movie.AviCount,Movie.AviFnameShort);
++		sprintf(&filename[0],"%s%s%s_%03d.avi",Movie.AviDrive,Movie.AviDirectory,Movie.AviFnameShort,Movie.AviCount);
+ 		RECORD_BI.biWidth = Config.CurWinX;
+ 		RECORD_BI.biHeight = Config.CurWinY;
+ 	}
+@@ -83,7 +83,10 @@
+ 	else
+ 	{
+ 		Config.SplitAVI = true;
+-		sprintf(&filename[0],"%s%s%03d_%s-%dx%d.avi",Movie.AviDrive,Movie.AviDirectory,Movie.AviCount,Movie.AviFnameShort,Config.CurWinX, Config.CurWinY);
++		if (Config.AppendRes)
++			sprintf(&filename[0],"%s%s%s_%03d-%dx%d.avi",Movie.AviDrive,Movie.AviDirectory,Movie.AviFnameShort,Movie.AviCount,Config.CurWinX, Config.CurWinY);
++		else
++			sprintf(&filename[0],"%s%s%s_%03d.avi",Movie.AviDrive,Movie.AviDirectory,Movie.AviFnameShort,Movie.AviCount);
+ 		RECORD_BI.biWidth = Config.CurWinX;
+ 		RECORD_BI.biHeight = Config.CurWinY;
+ 	}
+Index: PsxCommon.h
+===================================================================
+--- PsxCommon.h	(revision 726)
++++ PsxCommon.h	(working copy)
+@@ -169,6 +169,7 @@
+ 	bool GetAutoHold;
+ 	bool GetAutoFire;
+ 	bool AutoFireFrame;
++	bool AppendRes;
+ 	unsigned short Pad1AutoHold;
+ 	unsigned short Pad2AutoHold;
+ 	unsigned short Pad1AutoFire;
+Index: spu/record.cpp
+===================================================================
+--- spu/record.cpp	(revision 726)
++++ spu/record.cpp	(working copy)
+@@ -68,7 +68,7 @@
+ 	pcmwf.wBitsPerSample  = 16;
+ 
+ 	// create file
+-    sprintf(&szRecFileName[0],"%s%s%03d_%s.wav",Movie.AviDrive,Movie.AviDirectory,Movie.AviCount,Movie.AviFnameShort);
++    sprintf(&szRecFileName[0],"%s%s%s_%03d.wav",Movie.AviDrive,Movie.AviDirectory,Movie.AviFnameShort,Movie.AviCount);
+ 	hWaveFile=mmioOpen(szRecFileName,NULL,MMIO_CREATE|MMIO_WRITE|MMIO_EXCLUSIVE | MMIO_ALLOCBUF);
+ 	if (!hWaveFile) return;
+ 
+Index: Win32/ConfigurePlugins.cpp
+===================================================================
+--- Win32/ConfigurePlugins.cpp	(revision 726)
++++ Win32/ConfigurePlugins.cpp	(working copy)
+@@ -53,6 +53,8 @@
+ 	WritePrivateProfileString("Plugins", "Cdda", Str_Tmp, Conf_File);
+ 	wsprintf(Str_Tmp, "%d", Config.PauseAfterPlayback);
+ 	WritePrivateProfileString("Plugins", "PauseAfterPlayback", Str_Tmp, Conf_File);
++	wsprintf(Str_Tmp, "%d", Config.AppendRes);
++	WritePrivateProfileString("Plugins", "AppendResolution", Str_Tmp, Conf_File);
+ 	wsprintf(Str_Tmp, "%d", Config.PsxOut);
+ 	WritePrivateProfileString("Plugins", "PsxOut", Str_Tmp, Conf_File);
+ 	wsprintf(Str_Tmp, "%d", Config.RCntFix);
+@@ -87,6 +89,7 @@
+ 	Config.QKeys = GetPrivateProfileInt("Plugins", "QKeys", 0, Conf_File);
+ 	Config.Cdda = GetPrivateProfileInt("Plugins", "Cdda", 0, Conf_File);
+ 	Config.PauseAfterPlayback = GetPrivateProfileInt("Plugins", "PauseAfterPlayback", 0, Conf_File);
++	Config.AppendRes = GetPrivateProfileInt("Plugins", "AppendResolution", 1, Conf_File);
+ 	Config.PsxOut = GetPrivateProfileInt("Plugins", "PsxOut", 0, Conf_File);
+ 	Config.RCntFix = GetPrivateProfileInt("Plugins", "RCntFix", 0, Conf_File);
+ 	Config.VSyncWA = GetPrivateProfileInt("Plugins", "VSyncWA", 0, Conf_File);
+
+Index: Win32/psxjin.rc
+===================================================================
+--- Win32/psxjin.rc	(revision 726)
++++ Win32/psxjin.rc	(working copy)
+@@ -669,6 +659,7 @@
+ BEGIN
+     GROUPBOX        "Movie",IDC_STATIC,5,5,220,25
+     CONTROL         "Pause After Playback",IDC_PAUSE,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,15,15,83,10
++    CONTROL         "Append Resolution to AVI name",IDC_APPEND,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,104,15,113,10
+     GROUPBOX        "Misc",IDC_STATIC1,5,35,220,38
+     CONTROL         "Enable Console Output",IDC_PSXOUT,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,15,45,91,10
+     CONTROL         "Black && White Movies",IDC_MDEC,"Button",BS_AUTOCHECKBOX | WS_TABSTOP,15,58,85,10
+
+Index: Win32/resource.h
+===================================================================
+--- Win32/resource.h	(revision 726)
++++ Win32/resource.h	(working copy)
+@@ -424,6 +424,7 @@
+ #define IDC_DIGITALSELECT               1338
+ #define IDC_RADIO2                      1339
+ #define IDC_ANALOGSELECT                1339
++#define IDC_APPEND                      1340
+ #define IDC_C_WATCH_SEPARATE            1999
+ #define IDC_ER1                         8030
+ #define IDC_L3                          8031
+Index: Win32/WndMain.cpp
+===================================================================
+--- Win32/WndMain.cpp	(revision 726)
++++ Win32/WndMain.cpp	(working copy)
+@@ -1878,6 +1878,7 @@
+ 			Button_SetCheck(GetDlgItem(hW,IDC_PSXAUTO), Config.PsxAuto);
+ 			//Button_SetCheck(GetDlgItem(hW,IDC_CPU),     Config.Cpu);
+ 			Button_SetCheck(GetDlgItem(hW,IDC_PAUSE),   Config.PauseAfterPlayback);
++			Button_SetCheck(GetDlgItem(hW,IDC_APPEND),  Config.AppendRes);
+ 			Button_SetCheck(GetDlgItem(hW,IDC_PSXOUT),  Config.PsxOut);
+ 			Button_SetCheck(GetDlgItem(hW,IDC_RCNTFIX), Config.RCntFix);
+ 			Button_SetCheck(GetDlgItem(hW,IDC_VSYNCWA), Config.VSyncWA);
+@@ -1900,6 +1901,7 @@
+ 					Config.Cdda    = Button_GetCheck(GetDlgItem(hW,IDC_CDDA));
+ 					Config.PsxAuto = Button_GetCheck(GetDlgItem(hW,IDC_PSXAUTO));
+ 					Config.PauseAfterPlayback = Button_GetCheck(GetDlgItem(hW,IDC_PAUSE));
++					Config.AppendRes = Button_GetCheck(GetDlgItem(hW,IDC_APPEND));
+ 					/*tmp = Config.Cpu;
+ 					Config.Cpu     = Button_GetCheck(GetDlgItem(hW,IDC_CPU));
+ 					if (tmp != Config.Cpu) {
